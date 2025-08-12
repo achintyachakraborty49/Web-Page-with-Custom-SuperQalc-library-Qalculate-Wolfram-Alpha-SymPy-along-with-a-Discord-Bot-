@@ -1,2 +1,0 @@
-# advikmathlib
-Math library 
