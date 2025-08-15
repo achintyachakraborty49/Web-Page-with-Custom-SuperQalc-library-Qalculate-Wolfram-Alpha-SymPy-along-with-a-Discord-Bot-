@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import subprocess
 import sympy
@@ -8,6 +9,12 @@ import copy
 import chess
 import random
 from typing import Optional
+
+# extra imports for proxy
+import aiohttp
+from bs4 import BeautifulSoup
+from yarl import URL
+from urllib.parse import urljoin, quote
 
 # === CONFIG ===
 QALCULATE_PATH = "/data/data/com.termux/files/usr/bin/qalc"
@@ -221,3 +228,104 @@ def sudoku_solve(req: SudokuRequest):
             raise HTTPException(status_code=400, detail="No solution found")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+# === ROBLOX/GENERIC HTML PROXY ===
+@app.get("/roblox")
+def roblox_entry():
+    target = "https://www.roblox.com/"
+    return RedirectResponse(url=f"/proxy?url={quote(target, safe='')}")
+
+@app.get("/proxy")
+async def proxy(url: str, request: Request):
+    if not (url.startswith("http://") or url.startswith("https://")):
+        return Response("Invalid URL", status_code=400)
+
+    fwd_headers = {
+        "User-Agent": request.headers.get("user-agent", "Mozilla/5.0"),
+        "Accept": request.headers.get("accept", "*/*"),
+        "Accept-Language": request.headers.get("accept-language", "en-US,en;q=0.9"),
+        "Referer": request.headers.get("referer", ""),
+        "Cookie": request.headers.get("cookie", ""),
+        "Accept-Encoding": "identity",
+    }
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(url, headers=fwd_headers, allow_redirects=True) as resp:
+                status = resp.status
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                raw = await resp.read()
+
+                if "text/html" not in content_type.lower():
+                    headers = {}
+                    if "Content-Type" in resp.headers:
+                        headers["Content-Type"] = resp.headers["Content-Type"]
+                    if "Content-Length" in resp.headers:
+                        headers["Content-Length"] = resp.headers["Content-Length"]
+                    return Response(content=raw, status_code=status, headers=headers)
+
+                html = raw.decode(resp.charset or "utf-8", errors="replace")
+                soup = BeautifulSoup(html, "html.parser")
+
+                for m in soup.find_all("meta"):
+                    http_equiv = (m.get("http-equiv") or "").lower()
+                    if http_equiv in ["content-security-policy", "x-frame-options"]:
+                        m.decompose()
+
+                for fr in soup.find_all("iframe"):
+                    if "sandbox" in fr.attrs:
+                        del fr.attrs["sandbox"]
+
+                for tag in soup.find_all(["script", "link"]):
+                    if "integrity" in tag.attrs:
+                        del tag.attrs["integrity"]
+                    if "nonce" in tag.attrs:
+                        del tag.attrs["nonce"]
+
+                base_url = str(URL(url))
+
+                def proxify(attr_val: str) -> str:
+                    if not attr_val:
+                        return attr_val
+                    absolute = urljoin(base_url, attr_val)
+                    return f"/proxy?url={quote(absolute, safe='')}"
+
+                rewrites = [
+                    ("a", "href"),
+                    ("img", "src"),
+                    ("script", "src"),
+                    ("link", "href"),
+                    ("form", "action"),
+                    ("source", "src"),
+                    ("video", "src"),
+                    ("audio", "src"),
+                    ("track", "src"),
+                ]
+
+                for tag, attr in rewrites:
+                    for el in soup.find_all(tag):
+                        val = el.get(attr)
+                        if not val:
+                            continue
+                        low = val.strip().lower()
+                        if low.startswith(("data:", "mailto:", "javascript:")):
+                            continue
+                        el[attr] = proxify(val)
+
+                head = soup.find("head")
+                if head:
+                    base_tag = soup.new_tag("base")
+                    base_tag["href"] = f"/proxy?url={quote(base_url, safe='')}"
+                    head.insert(0, base_tag)
+
+                final_html = str(soup).encode("utf-8")
+
+                return Response(
+                    content=final_html,
+                    media_type="text/html; charset=utf-8",
+                    status_code=status,
+                )
+
+        except Exception as e:
+            return Response(f"Proxy error: {e}", status_code=502)
